@@ -1,153 +1,188 @@
+"""
+Compare CP optimization against RL (PPO) results.
+
+Reads the RL evaluation workbook (one sheet per episode with input columns
+Order, Type, Ui, Due Date, p0, p1 and RL result columns), solves each episode
+with the CP model, and writes a new workbook comparing CP vs RL for every
+episode plus a summary sheet.
+
+Mapping:
+    Type 0 -> Agent A  (tardiness-penalized)
+    Type 1 -> Agent B  (must finish before makespan / Cmax)
+    Ui      -> amount
+    p0      -> per-unit process time on machine 1
+    p1      -> per-unit process time on machine 2
+"""
+
 from docplex.cp.model import *
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.cm import get_cmap
+import openpyxl
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+# ---------------------------------------------------------------------------
+# CONFIG -- edit these two paths for your machine
+# ---------------------------------------------------------------------------
+INPUT_FILE  = "evaluation_results_PPO_2facility_2agent_meanDi.xlsx"
+OUTPUT_FILE = "comparison_CP_vs_RL.xlsx"
+MACHINE_NUMBER = 2
 
 
-# ----------------------------------------------------------------------
-# Data
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Job container
+# ---------------------------------------------------------------------------
 class Job:
     def __init__(self, job_id, agent, amount, process_time, due_date):
         self.job_id = job_id
-        self.agent = agent
-        self.amount = amount
-        self.process_time = process_time
-        self.total_time = amount * process_time
+        self.agent = agent                      # "A" (Type 0) or "B" (Type 1)
+        self.amount = amount                    # Ui
+        self.process_time = process_time        # [p0, p1]
+        self.total_time = amount * max(process_time)
         self.due_date = due_date
 
 
-# amounts now in range 1-4
-job_list = [
-    Job(1,  "A", 4, 3, 30),
-    Job(2,  "A", 2, 4, 25),
-    Job(3,  "B", 3, 2, 40),
-    Job(4,  "A", 4, 2, 35),
-    Job(5,  "B", 1, 5, 50),
-    Job(6,  "A", 3, 3, 28),
-    Job(7,  "B", 4, 2, 45),
-    Job(8,  "A", 2, 4, 32),
-    Job(9,  "B", 3, 3, 38),
-    Job(10, "A", 4, 2, 30),
-]
+def build_jobs_from_df(df):
+    """Turn one episode's input rows into a list of Job objects."""
+    jobs = []
+    for _, row in df.iterrows():
+        agent = "A" if int(row["Type"]) == 0 else "B"
+        jobs.append(Job(
+            job_id=int(row["Order"]),
+            agent=agent,
+            amount=int(row["Ui"]),
+            process_time=[int(row["p0"]), int(row["p1"])],
+            due_date=float(row["Due Date"]),
+        ))
+    return jobs
 
 
-# ----------------------------------------------------------------------
-# Model
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CP model (same formulation, returns schedule + the two comparison metrics)
+# ---------------------------------------------------------------------------
 def CP_opt(job_list):
     job_number = len(job_list)
-    machine_number = 2
+    machine_number = MACHINE_NUMBER
 
-    x = {}   # interval variables (job i on machine j)
-    u = {}   # integer variables (units of job i on machine j)
-    T = {}   # tardiness of job i
-
+    x, u, T = {}, {}, {}
     mdl = CpoModel(name="splitting")
 
-    makespan = interval_var(name="makespan", start=(0, 200), end=(0, 200), size=0)
+    # horizon: sum of all longest durations is a safe upper bound
+    horizon = sum(j.total_time for j in job_list) + 1
+    makespan = interval_var(name="makespan", start=(0, horizon), end=(0, horizon), size=0)
 
     for i in range(job_number):
-        T[i] = integer_var(name='T_{}'.format(i + 1), min=0, max=1000)
+        T[i] = integer_var(name='T_{}'.format(i + 1), min=0, max=10000)
         for j in range(machine_number):
+            max_size = job_list[i].amount * job_list[i].process_time[j]
             x[i, j] = interval_var(
                 name='x_{}_{}'.format(i + 1, j + 1),
-                start=(0, 200), end=(0, 200),
-                optional=True, size=(0, job_list[i].total_time))
+                start=(0, horizon), end=(0, horizon),
+                optional=True, size=(0, max_size))
             u[i, j] = integer_var(
                 name='u_{}_{}'.format(i + 1, j + 1),
                 min=0, max=job_list[i].amount)
 
-    # --- linking duration to units (no redundant presence_of product) ---
     for i in range(job_number):
         for j in range(machine_number):
-            # size is 0 automatically when interval is absent, so this also
-            # forces u = 0 when absent. No variable*variable product needed.
-            mdl.add(size_of(x[i, j]) == job_list[i].process_time * u[i, j])
-            # present  <=>  at least one unit
+            mdl.add(size_of(x[i, j]) == job_list[i].process_time[j] * u[i, j])
             mdl.add(presence_of(x[i, j]) == (u[i, j] >= 1))
 
-    # --- all units of each job must be produced (now linear) ---
     for i in range(job_number):
         mdl.add(sum(u[i, j] for j in range(machine_number)) == job_list[i].amount)
 
-    # --- one sequence per machine, no overlap ---
     for j in range(machine_number):
         seq = sequence_var([x[i, j] for i in range(job_number)],
                            types=[k for k in range(job_number)])
         mdl.add(no_overlap(seq))
 
-    # --- tardiness for agent A jobs ---
     for i in range(job_number):
         if job_list[i].agent == "A":
             for j in range(machine_number):
                 mdl.add(T[i] >= end_of(x[i, j]) - job_list[i].due_date)
-
-    # --- agent B jobs must finish before makespan ---
-    for i in range(job_number):
-        if job_list[i].agent == "B":
+        else:  # agent B
             for j in range(machine_number):
                 mdl.add(end_before_start(x[i, j], makespan))
 
     mdl.minimize(0.8 * mdl.sum(T[i] for i in range(job_number)) + 0.2 * end_of(makespan))
 
-    msol = mdl.solve()
+    msol = mdl.solve(LogVerbosity="Quiet")
 
+    # --- extract schedule ---
     result = []
-    Tardiness = 0
-    makespan_val = msol.get_var_solution(makespan).get_end()
-    for i in range(job_number):
-        if job_list[i].agent == "A":
-            Tardiness += msol[T[i]]
-
     for i in range(job_number):
         for j in range(machine_number):
             sol = msol.get_var_solution(x[i, j])
             if sol.is_present():
-                result.append([job_list[i].job_id, j + 1,
+                result.append([job_list[i].job_id, job_list[i].agent, j + 1,
                                sol.get_start(), sol.get_size(), sol.get_end()])
+    schedule = pd.DataFrame(
+        result, columns=['Order', 'Type', 'Machine', 'Start', 'Duration', 'Finish'])
 
-    schedule = pd.DataFrame(result, columns=['Job', 'Machine', 'Start', 'Duration', 'Finish'])
-    return schedule, makespan_val, Tardiness
+    # --- comparison metrics ---
+    # Total tardiness over Type-0 (Agent A) jobs
+    total_tardiness = sum(msol[T[i]] for i in range(job_number)
+                          if job_list[i].agent == "A")
+    # Cmax over Type-1 (Agent B) jobs = latest finish among B jobs
+    b_finishes = [schedule[schedule['Order'] == job_list[i].job_id]['Finish'].max()
+                  for i in range(job_number) if job_list[i].agent == "B"]
+    cmax_typeB = max([f for f in b_finishes if pd.notna(f)] or [0])
+
+    return schedule, total_tardiness, cmax_typeB
 
 
-# ----------------------------------------------------------------------
-# Visualization
-# ----------------------------------------------------------------------
-def visualize(schedule, makespan):
-    JOBS = sorted(schedule['Job'].unique())
-    MACHINES = sorted(schedule['Machine'].unique())
-    sched = schedule.set_index(['Job', 'Machine'])
+# ---------------------------------------------------------------------------
+# Main: loop over every Episode_* sheet, solve, write comparison workbook
+# ---------------------------------------------------------------------------
+def main():
+    xls = pd.ExcelFile(INPUT_FILE)
+    episode_sheets = [s for s in xls.sheet_names if s.lower().startswith("episode")]
 
-    ct = int(sched['Finish'].max())
-    bar_style = {'alpha': 1.0, 'lw': 25, 'solid_capstyle': 'butt'}
-    text_style = {'color': 'white', 'weight': 'bold', 'ha': 'center', 'va': 'center'}
-    colors = get_cmap("Dark2").colors
+    # read RL summary if present
+    rl_summary = None
+    if "Summary" in xls.sheet_names:
+        rl_summary = pd.read_excel(INPUT_FILE, sheet_name="Summary")
 
-    fig, ax = plt.subplots(figsize=(12, 5 + (len(JOBS) + len(MACHINES)) / 4))
+    summary_rows = []
+    per_episode_schedules = {}
 
-    for jdx, j in enumerate(JOBS, 1):
-        for mdx, m in enumerate(MACHINES, 1):
-            if (j, m) in sched.index:
-                xs = sched.loc[(j, m), 'Start']
-                xf = sched.loc[(j, m), 'Finish']
-                ax.plot([xs, xf], [mdx] * 2, c=colors[jdx % 7], **bar_style)
-                ax.text((xs + xf) / 2, mdx, j, **text_style)
+    for sheet in episode_sheets:
+        df = pd.read_excel(INPUT_FILE, sheet_name=sheet)
+        ep_num = int(''.join(ch for ch in sheet if ch.isdigit()))
 
-    ax.set_title('Job Schedule')
-    ax.set_ylabel('Machine')
-    ax.set_ylim(0.5, len(MACHINES) + 0.5)
-    ax.set_yticks(range(1, 1 + len(MACHINES)))
-    ax.set_yticklabels(MACHINES)
-    ax.set_xlim(0, ct + 1)
-    ax.set_xlabel('Time')
-    ax.plot([makespan] * 2, ax.get_ylim(), 'r--')
-    ax.grid(True)
-    plt.show()
+        jobs = build_jobs_from_df(df[['Order', 'Type', 'Ui', 'Due Date', 'p0', 'p1']])
+        schedule, cp_tardiness, cp_cmax = CP_opt(jobs)
+        per_episode_schedules[sheet] = schedule
+
+        # RL metrics from the summary sheet
+        rl_cmax = rl_tard = None
+        if rl_summary is not None:
+            row = rl_summary[rl_summary['Episode'] == ep_num]
+            if not row.empty:
+                rl_cmax = row['Final Cmax (Type 1)'].values[0]
+                rl_tard = row['Total Tardiness (Type 0)'].values[0]
+
+        summary_rows.append({
+            'Episode': ep_num,
+            'CP_Cmax (Type 1)': cp_cmax,
+            'RL_Cmax (Type 1)': rl_cmax,
+            'CP_Tardiness (Type 0)': cp_tardiness,
+            'RL_Tardiness (Type 0)': rl_tard,
+            'Cmax_diff (RL-CP)': (rl_cmax - cp_cmax) if rl_cmax is not None else None,
+            'Tardiness_diff (RL-CP)': (rl_tard - cp_tardiness) if rl_tard is not None else None,
+        })
+        print("Episode {:>2}:  CP Cmax={}, CP Tardiness={}  |  RL Cmax={}, RL Tardiness={}".format(
+            ep_num, cp_cmax, cp_tardiness, rl_cmax, rl_tard))
+
+    summary_df = pd.DataFrame(summary_rows).sort_values('Episode')
+
+    # --- write everything to one workbook ---
+    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+        summary_df.to_excel(writer, sheet_name='Comparison_Summary', index=False)
+        for sheet, sched in per_episode_schedules.items():
+            ep_num = int(''.join(ch for ch in sheet if ch.isdigit()))
+            sched.to_excel(writer, sheet_name='CP_Episode_{}'.format(ep_num), index=False)
+
+    print("\nWrote results to", OUTPUT_FILE)
 
 
 if __name__ == "__main__":
-    schedule, makespan, Tardiness = CP_opt(job_list)
-    print("Tardiness:", Tardiness, "Makespan:", makespan)
-    print(schedule)
-    visualize(schedule, makespan)
+    main()
