@@ -15,6 +15,8 @@ Mapping:
 """
 
 from docplex.cp.model import *
+from docplex.cp.config import context
+context.solver.local.execfile = "/Applications/CPLEX_Studio2211/cpoptimizer/bin/arm64_osx/cpoptimizer"
 import pandas as pd
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows

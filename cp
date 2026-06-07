@@ -1,5 +1,9 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import time
 from docplex.cp.model import *
+from docplex.cp.config import context
+context.solver.local.execfile = "/Applications/CPLEX_Studio2211/cpoptimizer/bin/arm64_osx/cpoptimizer"
 from data import data_read
 import numpy as np
 import csv
